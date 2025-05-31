@@ -1,10 +1,276 @@
-data{
-	person:{
-	name:"John Brow",
-	age:15
-	},
-	person:{
-	name:"Bliiy Gates",
-	age:"60"
-	}
-}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Taxi Hailing App</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        fieldset { margin-bottom: 20px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; background-color: #fff; }
+        legend { font-weight: bold; padding: 0 10px; }
+        .response { margin-top: 10px; padding: 8px; border: 1px dashed #eee; min-height: 20px; background-color: #e9e9e9; border-radius: 3px; font-size: 0.9em; }
+        .hidden { display: none; }
+        input[type="text"] { margin-bottom: 10px; padding: 8px; width: 250px; border: 1px solid #ddd; border-radius: 3px; box-sizing: border-box; }
+        button { padding: 10px 15px; margin-right: 5px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 3px; font-size: 0.95em; }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        label { display: inline-block; margin-bottom: 5px; font-weight: 500; }
+        #loggedInUserPhone { color: #28a745; font-weight: bold; }
+        h1 { text-align: center; color: #0056b3; }
+    </style>
+</head>
+<body>
+    <h1>Taxi Hailing App</h1>
+
+    <fieldset>
+        <legend>1. Phone Verification</legend>
+        <label for="phoneForVerify">Phone Number:</label><br>
+        <input type="text" id="phoneForVerify" name="phoneForVerify" placeholder="Enter your phone number"><br>
+        <button id="sendVerifyCodeBtn">Send Verification Code</button>
+        <br><br>
+        <label for="verificationCode">Verification Code:</label><br>
+        <input type="text" id="verificationCode" name="verificationCode" placeholder="Enter code received"><br>
+        <button id="verifyCodeBtn">Verify Code & Create Account</button>
+        <div id="verifyResponse" class="response"></div>
+    </fieldset>
+
+    <fieldset>
+        <legend>2. User Login</legend>
+        <label for="phoneForLogin">Phone Number:</label><br>
+        <input type="text" id="phoneForLogin" name="phoneForLogin" placeholder="Enter your verified phone number"><br>
+        <button id="loginBtn">Login</button>
+        <div id="loginResponse" class="response"></div>
+        <div id="loggedInUserPhone" style="margin-top:10px;"></div>
+    </fieldset>
+
+    <div id="userActions" class="hidden">
+        <fieldset>
+            <legend>3. Cab Request</legend>
+            <label for="fromLocation">From:</label><br>
+            <input type="text" id="fromLocation" name="fromLocation" placeholder="e.g., Home"><br>
+            <label for="toLocation">To:</label><br>
+            <input type="text" id="toLocation" name="toLocation" placeholder="e.g., Work"><br>
+            <button id="requestCabBtn">Request Cab</button>
+            <div id="cabRequestResponse" class="response"></div>
+        </fieldset>
+
+        <fieldset>
+            <legend>4. Cab Request Info</legend>
+            <button id="getCabInfoBtn">Get My Cab Request Info</button>
+            <div id="cabInfoResponse" class="response" style="white-space: pre-wrap;"></div>
+            <input type="hidden" id="activeCabRequestID">
+        </fieldset>
+
+        <fieldset>
+            <legend>5. Cancel Cab Request</legend>
+            <button id="cancelCabBtn" disabled>Cancel My Cab Request</button>
+            <div id="cancelCabResponse" class="response"></div>
+        </fieldset>
+    </div>
+
+    <script>
+        let loggedInUser = null;
+        let currentCabRequestID = null;
+
+        const API_BASE_URL = window.location.origin; // Assumes API is on the same host
+
+        // Helper function for API calls
+        async function fetchAPI(endpoint, params = {}, responseDivId) {
+            const queryString = new URLSearchParams(params).toString();
+            const url = `${API_BASE_URL}${endpoint}?${queryString}`;
+            const responseDiv = document.getElementById(responseDivId);
+
+            if (responseDiv) responseDiv.textContent = 'Loading...';
+
+            try {
+                const response = await fetch(url);
+                const data = await response.json(); // Assuming all API responses are JSON
+                return { ok: response.ok, data, responseDiv };
+            } catch (error) {
+                console.error('API Fetch Error:', error, 'URL:', url);
+                if (responseDiv) responseDiv.textContent = 'Network or API error: ' + error.message;
+                return { ok: false, data: { status: 'error', message: error.message, details: 'Fetch failed' }, responseDiv };
+            }
+        }
+
+        // --- 1. Phone Verification ---
+        document.getElementById('sendVerifyCodeBtn').addEventListener('click', async () => {
+            const phoneNumber = document.getElementById('phoneForVerify').value;
+            const responseDivId = 'verifyResponse';
+            if (!phoneNumber) {
+                document.getElementById(responseDivId).textContent = 'Please enter a phone number.';
+                return;
+            }
+
+            const { ok, data, responseDiv } = await fetchAPI('/verify', { pnumber: phoneNumber }, responseDivId);
+
+            if (ok && data.status === 'success' && data.data && typeof data.data.code !== 'undefined') {
+                responseDiv.textContent = `Verification code: ${data.data.code}. Enter below. (This is for simulation, in production the code would be sent via SMS/other means)`;
+            } else {
+                responseDiv.textContent = 'Failed to send code: ' + (data.message || (data.data && (data.data.pnumber || data.data.message || JSON.stringify(data.data))) || 'Unknown error');
+            }
+        });
+
+        document.getElementById('verifyCodeBtn').addEventListener('click', async () => {
+            const phoneNumber = document.getElementById('phoneForVerify').value;
+            const code = document.getElementById('verificationCode').value;
+            const responseDivId = 'verifyResponse';
+
+            if (!phoneNumber || !code) {
+                document.getElementById(responseDivId).textContent = 'Please enter both phone number and verification code.';
+                return;
+            }
+
+            const { ok, data, responseDiv } = await fetchAPI('/validate', { pnumber: phoneNumber, pcode: code }, responseDivId);
+
+            if (ok && data.status === 'success' && data.data && data.data.status === 1) {
+                responseDiv.textContent = 'Verification successful! Account created. You can now log in with your phone number.';
+            } else {
+                responseDiv.textContent = 'Verification failed: ' + (data.message || (data.data && (data.data.pcode || data.data.message || JSON.stringify(data.data))) || 'Invalid code or other error.');
+            }
+        });
+
+        // --- 2. User Login ---
+        document.getElementById('loginBtn').addEventListener('click', async () => {
+            const phoneNumber = document.getElementById('phoneForLogin').value;
+            const responseDivId = 'loginResponse';
+            const loggedInUserPhoneDiv = document.getElementById('loggedInUserPhone');
+            const userActionsDiv = document.getElementById('userActions');
+
+            if (!phoneNumber) {
+                document.getElementById(responseDivId).textContent = 'Please enter a phone number.';
+                return;
+            }
+
+            const { ok, data, responseDiv } = await fetchAPI('/login', { phoneNumber: phoneNumber }, responseDivId);
+
+            if (ok && data.status === 'success' && data.data && data.data.status === 1) {
+                loggedInUser = phoneNumber;
+                loggedInUserPhoneDiv.textContent = `Logged in as: ${loggedInUser}`;
+                responseDiv.textContent = 'Login successful!';
+                userActionsDiv.classList.remove('hidden');
+                // Clear previous states
+                document.getElementById('cabInfoResponse').textContent = '';
+                document.getElementById('cabRequestResponse').textContent = '';
+                document.getElementById('cancelCabResponse').textContent = '';
+                document.getElementById('activeCabRequestID').value = '';
+                document.getElementById('cancelCabBtn').disabled = true;
+                currentCabRequestID = null;
+                 // Automatically try to fetch cab info if user logs back in
+                document.getElementById('getCabInfoBtn').click();
+            } else {
+                loggedInUser = null;
+                loggedInUserPhoneDiv.textContent = '';
+                responseDiv.textContent = 'Login failed: ' + (data.message || 'User not found or unknown error.');
+                userActionsDiv.classList.add('hidden');
+            }
+        });
+
+        // --- 3. Cab Request ---
+        document.getElementById('requestCabBtn').addEventListener('click', async () => {
+            const responseDivId = 'cabRequestResponse';
+            if (!loggedInUser) {
+                document.getElementById(responseDivId).textContent = 'Please log in first.';
+                return;
+            }
+            const fromLocation = document.getElementById('fromLocation').value;
+            const toLocation = document.getElementById('toLocation').value;
+
+            if (!fromLocation || !toLocation) {
+                document.getElementById(responseDivId).textContent = 'Please enter both "From" and "To" locations.';
+                return;
+            }
+
+            const { ok, data, responseDiv } = await fetchAPI('/requestcab', {
+                phoneNumber: loggedInUser,
+                from: fromLocation,
+                to: toLocation
+            }, responseDivId);
+
+            if (ok && data.status === 'success' && data.data && data.data.status === 1) {
+                responseDiv.textContent = 'Cab requested successfully!';
+                // Automatically fetch info after request
+                document.getElementById('getCabInfoBtn').click();
+            } else {
+                responseDiv.textContent = 'Cab request failed: ' + (data.message || 'Unknown error.');
+            }
+        });
+
+        // --- 4. Cab Request Info ---
+        document.getElementById('getCabInfoBtn').addEventListener('click', async () => {
+            const responseDivId = 'cabInfoResponse';
+            const activeCabRequestIDInput = document.getElementById('activeCabRequestID');
+            const cancelCabBtn = document.getElementById('cancelCabBtn');
+
+            if (!loggedInUser) {
+                document.getElementById(responseDivId).textContent = 'Please log in first.';
+                return;
+            }
+
+            const { ok, data, responseDiv } = await fetchAPI('/getrequestinfo', { phoneNumber: loggedInUser }, responseDivId);
+
+            if (ok && data.status === 'success' && data.data && data.data.request) {
+                const requestDetails = data.data.request;
+                responseDiv.textContent = `
+ID: ${requestDetails.id}
+From: ${requestDetails.from}
+To: ${requestDetails.to}
+Status: ${requestDetails.status === 1 ? 'Active' : 'Inactive/Cancelled'}
+ETA: ${requestDetails.eta || 'N/A'}
+Requested At: ${new Date(requestDetails.createdAt).toLocaleString()}
+                `.trim().replace(/^\s+/gm, ''); // Clean up whitespace
+
+                if (requestDetails.status === 1) { // Only enable if active
+                    currentCabRequestID = requestDetails.id;
+                    activeCabRequestIDInput.value = requestDetails.id;
+                    cancelCabBtn.disabled = false;
+                } else {
+                    currentCabRequestID = null;
+                    activeCabRequestIDInput.value = '';
+                    cancelCabBtn.disabled = true;
+                    if(requestDetails.status === 0 && responseDiv.textContent.includes("Active")) { // Small correction if status was 0 but text said active
+                        responseDiv.textContent = responseDiv.textContent.replace("Status: Active", "Status: Inactive/Cancelled");
+                    }
+                }
+            } else {
+                responseDiv.textContent = 'Failed to get cab info: ' + (data.message || 'No active request found or error.');
+                currentCabRequestID = null;
+                activeCabRequestIDInput.value = '';
+                cancelCabBtn.disabled = true;
+            }
+        });
+
+        // --- 5. Cancel Cab Request ---
+        document.getElementById('cancelCabBtn').addEventListener('click', async () => {
+            const responseDivId = 'cancelCabResponse';
+            const cabInfoResponseDiv = document.getElementById('cabInfoResponse');
+            const activeCabRequestIDInput = document.getElementById('activeCabRequestID');
+            const cancelCabBtn = document.getElementById('cancelCabBtn');
+
+            if (!loggedInUser) {
+                document.getElementById(responseDivId).textContent = 'Please log in first.';
+                return;
+            }
+            if (!currentCabRequestID) {
+                document.getElementById(responseDivId).textContent = 'No active cab request ID found to cancel. Try "Get My Cab Request Info" first.';
+                return;
+            }
+
+            const { ok, data, responseDiv } = await fetchAPI('/cancelrequest', { requestID: currentCabRequestID }, responseDivId);
+
+            if (ok && data.status === 'success' && data.data && data.data.status === 1) {
+                responseDiv.textContent = 'Cab request cancelled successfully.';
+                currentCabRequestID = null;
+                activeCabRequestIDInput.value = '';
+                cabInfoResponseDiv.textContent = 'Your request has been cancelled.';
+                cancelCabBtn.disabled = true;
+            } else {
+                responseDiv.textContent = 'Failed to cancel cab request: ' + (data.message || 'Unknown error, or request already inactive.');
+                 // Potentially re-fetch info to confirm status
+                document.getElementById('getCabInfoBtn').click();
+            }
+        });
+
+    </script>
+</body>
+</html>
