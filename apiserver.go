@@ -15,32 +15,38 @@ import (
 	"github.com/user/apiserver/useraccount"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
+
+	"apiserver/config" // Added config import
 )
 
-const emptyData = `{"data":{"status":0}}`
-const successData = `{"data":{"status":1}}`
-const connstr = "localhost:27017"
+// Helper function to send JSON responses
+func sendJSONResponse(res http.ResponseWriter, statusCode int, data interface{}) {
+	res.Header().Set("Content-Type", "application/json; charset=utf-8")
+	res.WriteHeader(statusCode)
+	if err := json.NewEncoder(res).Encode(data); err != nil {
+		log.Printf("Error encoding JSON response: %v", err)
+		// Fallback if JSON encoding fails, though ideally this should not happen.
+		http.Error(res, `{"status":"error", "message":"Internal server error encoding response"}`, http.StatusInternalServerError)
+	}
+}
 
-func readFile(f string) string {
-	file, err := os.Open(f)
-	if err != nil {
-		// handle the error here
-		return ""
-	}
-	defer file.Close()
-	// get the file size
-	stat, err := file.Stat()
-	if err != nil {
-		return ""
-	}
-	// read the file
-	bs := make([]byte, stat.Size())
-	_, err = file.Read(bs)
+// Error response structure
+type ErrorResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Details string `json:"details,omitempty"`
+}
 
-	if err != nil {
-		return ""
-	}
-	return string(bs)
+// Success response structure for simple status
+type SuccessStatusResponse struct {
+	Status string            `json:"status"`
+	Data   map[string]int `json:"data"`
+}
+
+// Success response for data
+type SuccessDataResponse struct {
+	Status string      `json:"status"`
+	Data   interface{} `json:"data"`
 }
 
 //PhoneCode stores the code and phone number combination.
@@ -49,195 +55,214 @@ type PhoneCode struct {
 	VerificationCode int
 }
 
-func addVerifyPhone(phone string) (bool, int) {
-	session, err := mgo.Dial(connstr)
+func addVerifyPhone(phone string) (int, error) {
+	session, err := mgo.Dial(config.MongoConnStr) // Replaced connstr
 	if err != nil {
-		//log.Fatal(err)
-		return false, 0
+		log.Printf("Error dialing MongoDB: %v", err)
+		return 0, err
 	}
 	defer session.Close()
 
-	// Optional. Switch the session to a monotonic behavior.
 	session.SetMode(mgo.Monotonic, true)
-
 	c := session.DB("elite-taxi-app").C("phone_code_verify")
+
 	rand.Seed(time.Now().UnixNano())
-	code := rand.Intn(9999)
-	err = c.Insert(&PhoneCode{phone, code})
+	code := rand.Intn(9999) // Generate a 4-digit code
+
+	// Remove any existing code for this phone number to avoid conflicts if re-verifying
+	_, err = c.RemoveAll(bson.M{"phonenumber": phone})
 	if err != nil {
-		//log.Fatal(err)
-		return false, 0
+		log.Printf("Error removing existing phone code for %s: %v", phone, err)
+		// Decide if this is a fatal error for the operation.
+		// For now, we'll log and continue, as inserting a new code might still work.
 	}
-	result := PhoneCode{}
-	err = c.Find(bson.M{"phonenumber": phone}).One(&result)
+
+	err = c.Insert(&PhoneCode{PhoneNumber: phone, VerificationCode: code})
 	if err != nil {
-		log.Fatal(err)
-		return false, 0
+		log.Printf("Error inserting phone code: %v", err)
+		return 0, err
 	}
-	return true, code
+	// No need to find it again, we have the code.
+	return code, nil
 }
 
-// check phone number checks a phone number and code against the database to ensuure
-// that the combination exists.
-
-func validPhoneNumberCombo(phoneNumber string, verifyCode int) bool {
-	session, err := mgo.Dial(connstr)
+func validPhoneNumberCombo(phoneNumber string, verifyCode int) (bool, error) {
+	session, err := mgo.Dial(config.MongoConnStr) // Replaced connstr
 	if err != nil {
-		//log.Fatal(err)
-		return false
+		log.Printf("Error dialing MongoDB: %v", err)
+		return false, err
 	}
 	defer session.Close()
-	// Optional. Switch the session to a monotonic behavior.
+
 	session.SetMode(mgo.Monotonic, true)
 	c := session.DB("elite-taxi-app").C("phone_code_verify")
 	result := PhoneCode{}
 	err = c.Find(bson.M{"phonenumber": phoneNumber, "verificationcode": verifyCode}).One(&result)
 	if err != nil {
-		//log.Fatal(err)
-		return false
+		if err == mgo.ErrNotFound {
+			return false, nil // Combination not found, but not a server error
+		}
+		log.Printf("Error finding phone number combo: %v", err)
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
 func validatePhone(res http.ResponseWriter, req *http.Request) {
-	pageData := ""
 	phone := req.URL.Query().Get("pnumber")
-	pCode, err := strconv.Atoi(req.URL.Query().Get("pcode"))
+	pCodeStr := req.URL.Query().Get("pcode")
 
+	if phone == "" || pCodeStr == "" {
+		sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "fail", Message: "Phone number and code are required."})
+		return
+	}
+
+	pCode, err := strconv.Atoi(pCodeStr)
 	if err != nil {
-		fmt.Println("Error:", err)
+		sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "fail", Data: map[string]string{"pcode": "Invalid verification code format."}})
+		return
 	}
 
-	if validPhoneNumberCombo(phone, pCode) {
+	valid, err := validPhoneNumberCombo(phone, pCode)
+	if err != nil {
+		sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Error validating phone number combo.", Details: err.Error()})
+		return
+	}
+
+	if valid {
 		userAccount := useraccount.UserAccount{PhoneNumber: phone, Name: "", Address: "", Status: 1}
-		userAccount.AddAccount()
-		pageData = successData
+		if err := userAccount.AddAccount(); err != nil {
+			// Check if the error is due to duplicate phone number (which means account already exists)
+			// This depends on how mgo/MongoDB driver reports unique constraint violations.
+			// For a more robust check, you might need to query UserExists first or parse the error.
+			// For now, assume any error from AddAccount is a server-side issue.
+			sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Failed to create account.", Details: err.Error()})
+			return
+		}
+		sendJSONResponse(res, http.StatusOK, SuccessStatusResponse{Status: "success", Data: map[string]int{"status": 1}})
 	} else {
-		pageData = emptyData
+		sendJSONResponse(res, http.StatusUnauthorized, ErrorResponse{Status: "fail", Message: "Invalid phone number or verification code."})
 	}
-
-	res.Header().Set(
-		"Content-Type",
-		"application/json; charset=utf-8",
-	)
-	io.WriteString(
-		res,
-		pageData,
-	)
 }
 
 func verifyPhone(res http.ResponseWriter, req *http.Request) {
-
 	phone := req.URL.Query().Get("pnumber")
-	verify, code := addVerifyPhone(phone)
-	var pageData string
-	if verify == true {
-		data := map[string]map[string]int{"data": {"status": 1, "code": code}}
-		dat, _ := json.Marshal(data)
-		pageData = string(dat)
-	} else {
-
-		pageData = emptyData
+	if phone == "" {
+		sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "fail", Data: map[string]string{"pnumber": "Phone number is required."}})
+		return
 	}
 
-	res.Header().Set(
-		"Content-Type",
-		"application/json; charset=utf-8",
-	)
-	io.WriteString(
-		res,
-		pageData,
-	)
+	code, err := addVerifyPhone(phone)
+	if err != nil {
+		sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Failed to generate verification code.", Details: err.Error()})
+		return
+	}
+
+	sendJSONResponse(res, http.StatusOK, SuccessDataResponse{Status: "success", Data: map[string]interface{}{"status": 1, "code": code}})
 }
 
 func login(res http.ResponseWriter, req *http.Request) {
-	pageData := ""
-
 	phoneNumber := req.URL.Query().Get("phoneNumber")
-
-	u := useraccount.UserAccount{}
-	if u.UserExists(phoneNumber) {
-		pageData = successData
-	} else {
-		pageData = emptyData
+	if phoneNumber == "" {
+		sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "fail", Data: map[string]string{"phoneNumber": "Phone number is required."}})
+		return
 	}
 
-	res.Header().Set(
-		"Content-Type",
-		"application/json; charset=utf-8",
-	)
-	io.WriteString(
-		res,
-		pageData,
-	)
+	u := useraccount.UserAccount{}
+	exists, err := u.UserExists(phoneNumber)
+	if err != nil {
+		sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Error checking user existence.", Details: err.Error()})
+		return
+	}
 
+	if exists {
+		sendJSONResponse(res, http.StatusOK, SuccessStatusResponse{Status: "success", Data: map[string]int{"status": 1}})
+	} else {
+		sendJSONResponse(res, http.StatusNotFound, ErrorResponse{Status: "fail", Message: "User not found."})
+	}
 }
 
 func requestCab(res http.ResponseWriter, req *http.Request) {
 	phone := req.URL.Query().Get("phoneNumber")
 	from := req.URL.Query().Get("from")
 	to := req.URL.Query().Get("to")
-	pageData := ""
 
-	//fmt.Println("Actual data: ", user)
-	cr := cabrequest.CabRequest{From: from, To: to, RequestedBy: phone,
-		ETA: "", Status: 1, CreatedAt: time.Now()}
-	err := cr.AddCabRequest()
-	if !err {
-		pageData = emptyData
-	} else {
-		pageData = successData
+	if phone == "" || from == "" || to == "" {
+		sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "fail", Message: "Phone number, from, and to locations are required."})
+		return
 	}
-	res.Header().Set(
-		"Content-Type",
-		"application/json; charset=utf-8",
-	)
-	io.WriteString(
-		res,
-		pageData,
-	)
+
+	cr := cabrequest.CabRequest{
+		From:        from,
+		To:          to,
+		RequestedBy: phone,
+		ETA:         "", // ETA could be calculated or set differently
+		Status:      1,  // Assuming 1 means active/pending
+		CreatedAt:   time.Now(),
+	}
+
+	if err := cr.AddCabRequest(); err != nil {
+		sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Failed to request cab.", Details: err.Error()})
+		return
+	}
+	sendJSONResponse(res, http.StatusOK, SuccessStatusResponse{Status: "success", Data: map[string]int{"status": 1}})
 }
 
 func cancelRequest(res http.ResponseWriter, req *http.Request) {
-	reqID := req.URL.Query().Get("phoneNumber")
-	pageData := ""
-	request := cabrequest.CabRequest{}
-	err := request.CancelRequest(reqID)
-	if !err {
-		pageData = emptyData
-	} else {
-		pageData = successData
+	reqID := req.URL.Query().Get("requestID")
+	if reqID == "" {
+		sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "fail", Message: "Request ID is required."})
+		return
 	}
-	res.Header().Set(
-		"Content-Type",
-		"application/json; charset=utf-8",
-	)
-	io.WriteString(
-		res,
-		pageData,
-	)
+
+	request := cabrequest.CabRequest{}
+	if err := request.CancelRequest(reqID); err != nil {
+		// Check for specific error messages from CancelRequest
+		if err.Error() == fmt.Sprintf("invalid request ID format: %s", reqID) {
+			sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "error", Message: err.Error()})
+		} else if err.Error() == fmt.Sprintf("active request with ID %s not found", reqID) {
+			sendJSONResponse(res, http.StatusNotFound, ErrorResponse{Status: "error", Message: err.Error()})
+		} else {
+			sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Failed to cancel request.", Details: err.Error()})
+		}
+		return
+	}
+	sendJSONResponse(res, http.StatusOK, SuccessStatusResponse{Status: "success", Data: map[string]int{"status": 1}})
 }
 
 func getRequestInfo(res http.ResponseWriter, req *http.Request) {
 	phone := req.URL.Query().Get("phoneNumber")
-	pageData := ""
-	request := cabrequest.CabRequest{}
-	detail := request.GetRequestDetail(phone)
-	if !detail {
-		pageData = emptyData
-	} else {
-		pageData += `{"data":{"status":1},`
-		pageData += request.ToString()
-		pageData += `}`
+	if phone == "" {
+		sendJSONResponse(res, http.StatusBadRequest, ErrorResponse{Status: "fail", Message: "Phone number is required."})
+		return
 	}
-	res.Header().Set(
-		"Content-Type",
-		"application/json; charset=utf-8",
-	)
-	io.WriteString(
-		res,
-		pageData,
-	)
+
+	request := cabrequest.CabRequest{}
+	if err := request.GetRequestDetail(phone); err != nil {
+		if err.Error() == fmt.Sprintf("request not found for phone %s", phone) {
+			sendJSONResponse(res, http.StatusNotFound, ErrorResponse{Status: "error", Message: err.Error()})
+		} else {
+			sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Failed to get request details.", Details: err.Error()})
+		}
+		return
+	}
+	// Assuming ToString() is still relevant and provides the core data.
+	// For a more robust JSON structure, populate a struct and marshal that.
+	// For now, we adapt the existing ToString() into a new structure.
+	requestJSON, err := request.ToString()
+	if err != nil {
+		log.Printf("Error marshalling request data: %v", err)
+		sendJSONResponse(res, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: "Failed to serialize request data.", Details: err.Error()})
+		return
+	}
+
+	// We use json.RawMessage to embed the already-marshaled JSON from request.ToString()
+	// into the "request" field of our response data.
+	responseData := map[string]interface{}{
+		"request": json.RawMessage(requestJSON),
+	}
+
+	sendJSONResponse(res, http.StatusOK, SuccessDataResponse{Status: "success", Data: responseData})
 }
 
 func main() {
